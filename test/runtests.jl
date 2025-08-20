@@ -48,8 +48,9 @@ end
     optcode = optimize_code(code, uniformsize(code, 2), OMEinsum.PathSA())
 
     Random.seed!(1234)
-    t1 = rand(2,2,2)
-    t2 = rand(2,2,2)
+    T = ComplexF64
+    t1 = rand(T,2,2,2)
+    t2 = rand(T,2,2,2)
 
     tensors = [t1, t2]
     right_answer = optcode(t1, t2)[]
@@ -79,16 +80,17 @@ end
     optcode = optimize_code(code, uniformsize(code, 2), OMEinsum.PathSA())
 
     Random.seed!(1234)
-    t1 = rand(2,2,2)
-    t2 = rand(2,2,2)
-    t3 = rand(2,2,2)
-    t4 = rand(2,2,2)
+    T = ComplexF64
+    t1 = rand(T, 2,2,2)
+    t2 = rand(T, 2,2,2)
+    t3 = rand(T, 2,2,2)
+    t4 = rand(T, 2,2,2)
     
     tensors = [t1, t2, t3, t4]
     right_answer = optcode(tensors...)[]
     @show right_answer
 
-    mps, apply_vec, tensor_labels, vanish_labels_vec = TreeContractor.code2mps(optcode,uniformsize(code, 2)); mps = TreeContractor.apply_tensors!(mps, apply_vec, tensors, tensor_labels, vanish_labels_vec)
+    mps, apply_vec, tensor_labels, vanish_labels_vec = TreeContractor.code2mps(T, optcode,uniformsize(code, 2)); mps = TreeContractor.apply_tensors!(mps, apply_vec, tensors, tensor_labels, vanish_labels_vec)
 
     @show mps.tensors
 

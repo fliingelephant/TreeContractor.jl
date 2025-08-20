@@ -17,14 +17,14 @@ end
 nsite(mps::LabeledMPS) = length(mps.labels)
 num_of_elements(mps::LabeledMPS) = sum(length, mps.tensors)
 
-function code2mps(code::DynamicNestedEinsum{LT}, size_dict::Dict{LT, Int}) where LT
+function code2mps(T::Type{<:Number}, code::DynamicNestedEinsum{LT}, size_dict::Dict{LT, Int}) where LT
     # labels = Vector{LT}()
     labels = copy(code.eins.iy)
     apply_vec = Vector{Int}()
     tensor_labels = Vector{Vector{LT}}()
     vanish_labels_vec = Vector{Vector{LT}}()
     _code2mps!(code, labels, apply_vec,tensor_labels, vanish_labels_vec)
-    tensors = [ones(Float64,1,size_dict[l],1) for l in labels]
+    tensors = [ones(T,1,size_dict[l],1) for l in labels]
     @assert length(tensors) == length(labels) "tensors and labels must have the same length"
     return LabeledMPS(tensors, labels), apply_vec, tensor_labels, vanish_labels_vec
 end
@@ -53,20 +53,17 @@ function _code2mps!(code::DynamicNestedEinsum{LT}, labels::Vector{LT}, apply_vec
     return nothing
 end
 
-function apply_tensors!(mps::LabeledMPS, apply_vec::Vector{Int}, tensors::Vector{<:AbstractArray{T}}, tensor_labels::Vector{Vector{LT}}, vanish_labels_vec::Vector{Vector{LT}}; maxdim = Inf) where {T<:Number, LT}
+function apply_tensors!(mps::LabeledMPS, apply_vec::Vector{Int}, tensors::Vector{<:AbstractArray{T}}, tensor_labels::Vector{Vector{LT}}, vanish_labels_vec::Vector{Vector{LT}}; atol::Real = √(eps(real(T))), maxdim::Int = typemax(Int)) where {T<:Number, LT}
     for (i,label, vanish_labels) in zip(apply_vec, tensor_labels, vanish_labels_vec)
-        mps = apply_tensor!(mps, tensors[i], label, vanish_labels)
-        # @info  mps.tensors .|> size
+        mps = apply_tensor!(mps, tensors[i], label, vanish_labels; atol, maxdim)
         if maximum(size.(mps.tensors,1)) > maxdim
             compress!(FullCompress(), mps; maxdim)
-            # @info "compress"
-            # @info  mps.tensors .|> size
         end
     end
     return mps
 end
 
-function apply_tensor!(mps::LabeledMPS, tensor::AbstractArray{T}, tensor_label::Vector{LT}, vanish_labels::Vector{LT}) where {T<:Number, LT}
+function apply_tensor!(mps::LabeledMPS, tensor::AbstractArray{T}, tensor_label::Vector{LT}, vanish_labels::Vector{LT}; atol::Real = √(eps(real(T))), maxdim::Int = typemax(Int)) where {T<:Number, LT}
     @assert length(tensor_label) == length(size(tensor)) "tensor_label and the dimension of tensor are not compatible"
     for (i,l) in enumerate(tensor_label)
         @assert size(mps.tensors[mps.label_to_index[l]],2) == size(tensor,i) "tensor_label and the dimension of tensor are not compatible at index $i"
@@ -78,24 +75,31 @@ function apply_tensor!(mps::LabeledMPS, tensor::AbstractArray{T}, tensor_label::
     nsite_mps = nsite(mps)
     pos = 1
     vanish_pos = Int[]
+
+    local env = nothing
     for i in mps.label_to_index[tensor_label[sorted_tensor_label[1]]]:mps.label_to_index[tensor_label[sorted_tensor_label[end]]]
         if mps.labels[i] == tensor_label[sorted_tensor_label[pos]]
             merge_tensor = mps_vec[pos]
             pos += 1
             if mps.labels[i] ∉ vanish_labels
-                mps.tensors[i] = apply_rank_3_tensor(mps.tensors[i], merge_tensor)
+                if env === nothing
+                    env = T.(I(size(mps.tensors[i],1) * size(merge_tensor,1)))
+                end
+                mps.tensors[i], env = _apply_rank_3_tensor(env, mps.tensors[i], merge_tensor; atol, maxdim)
             else
+                if env === nothing
+                    env = T.(I(size(mps.tensors[i],1) * size(merge_tensor,1)))
+                end
                 push!(vanish_pos, i)
-                mps.tensors[i] = apply_rank_3_tensor_with_vanish(mps.tensors[i], merge_tensor)
-                
+                mps.tensors[i], env = _apply_rank_3_tensor_with_vanish(env, mps.tensors[i], merge_tensor; atol, maxdim)
             end
         else
-            mps.tensors[i] = apply_rank_3_tensor(mps.tensors[i], delta_mps(bd_vec[pos], size(mps.tensors[i],2), T))
+            mps.tensors[i], env = _apply_rank_3_tensor(env, mps.tensors[i], delta_mps(bd_vec[pos], size(mps.tensors[i],2), T); atol, maxdim);
         end
 
-        # if i > 1
-        #     @assert size(mps.tensors[i],1) == size(mps.tensors[i-1],3)
-        # end
+        if i == mps.label_to_index[tensor_label[sorted_tensor_label[end]]]
+            mps.tensors[i] = ein"aib,bc->aic"(mps.tensors[i], env)
+        end
     end
 
     if !isempty(vanish_pos)
@@ -131,12 +135,38 @@ function apply_rank_3_tensor(tensor::AbstractArray{T,3}, merge_tensor::AbstractA
 end
 
 #          o-g-        
+#   d| e/ f|     =>   d|     f| g/
+# -a-o--b--o-c-     -a-o--be--o-c-
+function _apply_rank_3_tensor(Lenv::AbstractArray{T,2}, tensor::AbstractArray{T,3}, merge_tensor::AbstractArray{T,3};
+        maxdim::Int=typemax(Int), atol::Real=√(eps(real(T)))) where T
+    @assert size(Lenv, 2) == size(tensor, 1) * size(merge_tensor, 1)
+    Lenv = reshape(Lenv, size(Lenv,1), size(tensor,1), size(merge_tensor,1))
+    m = ein"abe, bfc, efg->afcg"(Lenv, tensor, merge_tensor)
+    m = reshape(m, size(m, 1)*size(m, 2), :)
+    U, S, V, err = truncated_svd(m, atol, maxdim)
+    return reshape(U, size(Lenv, 1), size(tensor, 2), :), Diagonal(S)*V
+end
+
+#          o-g-        
 #   d| e/ f|     =>   d|       g/
 # -a-o--b--o-c-     -a-o--be--o-c-
 function apply_rank_3_tensor_with_vanish(tensor::AbstractArray{T,3}, merge_tensor::AbstractArray{T,3}) where T
     merge_code = ein"bfc,efg->becg"
     m = merge_code(tensor, merge_tensor)
     return reshape(m, size(m,1)*size(m,2), size(m,3)*size(m,4),1)
+end
+
+#          o-g-        
+#   d| e/ f|     =>   d|       g/
+# -a-o--b--o-c-     -a-o--be--o-c-
+function _apply_rank_3_tensor_with_vanish(Lenv::AbstractArray{T,2}, tensor::AbstractArray{T,3}, merge_tensor::AbstractArray{T,3};
+        maxdim::Int=typemax(Int), atol::Real=√(eps(real(T)))) where T
+    @assert size(Lenv, 2) == size(tensor, 1) * size(merge_tensor, 1)
+    Lenv = reshape(Lenv, size(Lenv,1), size(tensor,1), size(merge_tensor,1))
+    m = ein"abe, bfc, efg->acg"(Lenv, tensor, merge_tensor)
+    m = reshape(m, size(m, 1), :)
+    U, S, V, err = truncated_svd(m, atol, maxdim)
+    return reshape(U, size(m, 1), :, 1), Diagonal(S)*V
 end
 
 function tensor2mps(tensor::AbstractArray{T}) where T
@@ -182,9 +212,9 @@ end
 contract_mps(mps::LabeledMPS) = contract_mps(mps.tensors)
 
 
-function contract_with_mps(optcode::DynamicNestedEinsum{LT}, tensors::Vector{<:AbstractArray{T}}, size_dict::Dict{LT, Int};maxdim = Inf) where {T<:Number, LT}
-    mps, apply_vec, tensor_labels, vanish_labels_vec = code2mps(optcode, size_dict)
-    mps = apply_tensors!(mps, apply_vec, tensors, tensor_labels, vanish_labels_vec; maxdim)
+function contract_with_mps(optcode::DynamicNestedEinsum{LT}, tensors::Vector{<:AbstractArray{T}}, size_dict::Dict{LT, Int}; atol::Real = √(eps(real(T))), maxdim::Int = typemax(Int)) where {T<:Number, LT}
+    mps, apply_vec, tensor_labels, vanish_labels_vec = code2mps(T, optcode, size_dict)
+    mps = apply_tensors!(mps, apply_vec, tensors, tensor_labels, vanish_labels_vec; atol, maxdim)
     return mps.tensors
 end
 
