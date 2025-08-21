@@ -56,9 +56,9 @@ end
 function apply_tensors!(mps::LabeledMPS, apply_vec::Vector{Int}, tensors::Vector{<:AbstractArray{T}}, tensor_labels::Vector{Vector{LT}}, vanish_labels_vec::Vector{Vector{LT}}; atol::Real = √(eps(real(T))), maxdim::Int = typemax(Int)) where {T<:Number, LT}
     for (i,label, vanish_labels) in zip(apply_vec, tensor_labels, vanish_labels_vec)
         mps = apply_tensor!(mps, tensors[i], label, vanish_labels; atol, maxdim)
-        if maximum(size.(mps.tensors,1)) > maxdim
-            compress!(FullCompress(), mps; maxdim)
-        end
+        #if maximum(size.(mps.tensors,1)) > maxdim
+        #    compress!(FullCompress(), mps; maxdim)
+        #end
     end
     return mps
 end
@@ -86,19 +86,21 @@ function apply_tensor!(mps::LabeledMPS, tensor::AbstractArray{T}, tensor_label::
                     env = T.(I(size(mps.tensors[i],1) * size(merge_tensor,1)))
                 end
                 mps.tensors[i], env = _apply_rank_3_tensor(env, mps.tensors[i], merge_tensor; atol, maxdim)
+                if i == mps.label_to_index[tensor_label[sorted_tensor_label[end]]]
+                    mps.tensors[i] = ein"aib,bc->aic"(mps.tensors[i], env)
+                end
             else
                 if env === nothing
                     env = T.(I(size(mps.tensors[i],1) * size(merge_tensor,1)))
                 end
                 push!(vanish_pos, i)
                 mps.tensors[i], env = _apply_rank_3_tensor_with_vanish(env, mps.tensors[i], merge_tensor; atol, maxdim)
+                if i == mps.label_to_index[tensor_label[sorted_tensor_label[end]]]
+                    mps.tensors[i] = ein"abi,bc->aci"(mps.tensors[i], env)
+                end
             end
         else
             mps.tensors[i], env = _apply_rank_3_tensor(env, mps.tensors[i], delta_mps(bd_vec[pos], size(mps.tensors[i],2), T); atol, maxdim);
-        end
-
-        if i == mps.label_to_index[tensor_label[sorted_tensor_label[end]]]
-            mps.tensors[i] = ein"aib,bc->aic"(mps.tensors[i], env)
         end
     end
 
@@ -142,9 +144,11 @@ function _apply_rank_3_tensor(Lenv::AbstractArray{T,2}, tensor::AbstractArray{T,
     @assert size(Lenv, 2) == size(tensor, 1) * size(merge_tensor, 1)
     Lenv = reshape(Lenv, size(Lenv,1), size(tensor,1), size(merge_tensor,1))
     m = ein"abe, bfc, efg->afcg"(Lenv, tensor, merge_tensor)
-    m = reshape(m, size(m, 1)*size(m, 2), :)
+    m = reshape(m, size(m, 1) * size(m, 2), size(m, 3) * size(m, 4))
     U, S, V, err = truncated_svd(m, atol, maxdim)
-    return reshape(U, size(Lenv, 1), size(tensor, 2), :), Diagonal(S)*V
+    sqrtS = sqrt.(S)
+    return reshape(ein"ab, b->ab"(U, sqrtS), size(Lenv, 1), size(tensor, 2), size(U, 2)), ein"a, ab->ab"(sqrtS,V)
+    # return reshape(U, size(Lenv, 1), size(tensor, 2), size(U, 2)), ein"a, ab->ab"(S,V)
 end
 
 #          o-g-        
@@ -164,9 +168,11 @@ function _apply_rank_3_tensor_with_vanish(Lenv::AbstractArray{T,2}, tensor::Abst
     @assert size(Lenv, 2) == size(tensor, 1) * size(merge_tensor, 1)
     Lenv = reshape(Lenv, size(Lenv,1), size(tensor,1), size(merge_tensor,1))
     m = ein"abe, bfc, efg->acg"(Lenv, tensor, merge_tensor)
-    m = reshape(m, size(m, 1), :)
+    m = reshape(m, size(m, 1), size(m, 2) * size(m, 3))
     U, S, V, err = truncated_svd(m, atol, maxdim)
-    return reshape(U, size(m, 1), :, 1), Diagonal(S)*V
+    sqrtS = sqrt.(S)
+    return reshape(ein"ab, b->ab"(U, sqrtS), size(m, 1), size(U, 2), 1), ein"a, ab->ab"(sqrtS, V)
+    # return reshape(U, size(m, 1), size(U, 2), 1), ein"a, ab->ab"(S, V)
 end
 
 function tensor2mps(tensor::AbstractArray{T}) where T
